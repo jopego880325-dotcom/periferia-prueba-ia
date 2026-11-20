@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { createChatServer } from "../src/chat/server.ts";
+import { SimulatedLlmAdapter } from "../src/llm/mock.ts";
+import type { LlmAdapter, ToolChatRequest, ToolChatResponse } from "../src/llm/adapter.ts";
 
-const server = createChatServer();
+const server = createChatServer({ adapter: new SimulatedLlmAdapter() });
 await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
 const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 const post = async (body: unknown) => fetch(`${base}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -58,4 +60,36 @@ test("blocked cases cannot create orders and session history is available", asyn
   const invalid = await post({ sessionId: blockedSession, message: "Confirmo" });
   const invalidBody = await invalid.json() as { reply: string; needsConfirmation: boolean };
   assert.equal(invalidBody.needsConfirmation, false); assert.match(invalidBody.reply, /Indica una solicitud/);
+});
+
+test("allowlist y Zod rechazan llamadas desconocidas y argumentos con payload arbitrario", async () => {
+  class InvalidToolAdapter implements LlmAdapter {
+    readonly provider = "test-local";
+    readonly model = "fixture-adapter";
+    private turn = 0;
+    lastMessages: ToolChatRequest["messages"] = [];
+    async respond() { return { text: "" }; }
+    async chatWithTools(request: ToolChatRequest): Promise<ToolChatResponse> {
+      this.lastMessages = request.messages;
+      this.turn++;
+      if (this.turn === 1) return { message: { role: "assistant", content: "", tool_calls: [
+        { function: { name: "oc_borrar_todo", arguments: { caso: "sol-001" } } },
+        { function: { name: "oc_leer_paquete", arguments: { caso: "sol-001", payload: { referencia: "falso" } } } }
+      ] } };
+      return { message: { role: "assistant", content: "Listo." } };
+    }
+  }
+  const adapter = new InvalidToolAdapter(); const testServer = createChatServer({ adapter });
+  await new Promise<void>(resolve => testServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = testServer.address() as AddressInfo;
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "Procesa sol-001" }) });
+    const body = await response.json() as { toolCalls: Array<{ name: string; status: string; result: string }>; reply: string };
+    assert.equal(response.status, 200); assert.equal(body.toolCalls.length, 2);
+    assert.equal(body.toolCalls[0].status, "blocked"); assert.match(body.toolCalls[0].result, /allowlist/);
+    assert.equal(body.toolCalls[1].status, "blocked"); assert.match(body.toolCalls[1].result, /Zod/);
+    assert.equal(body.toolCalls.some(call => call.name === "oc_crear"), false);
+    assert.equal(adapter.lastMessages.filter(message => message.role === "tool").length, 2);
+    assert.match(body.reply, /no solicitó leer/);
+  } finally { await new Promise<void>((resolve, reject) => testServer.close(error => error ? reject(error) : resolve())); }
 });

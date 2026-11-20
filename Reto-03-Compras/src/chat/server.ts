@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,12 +9,16 @@ import { leer_paquete, validar, construir_payload, generar_evidencia, crear } fr
 import type { Paquete, Validacion } from "../types.ts";
 import type { LlmAdapter } from "../llm/adapter.ts";
 import { SimulatedLlmAdapter } from "../llm/mock.ts";
+import { OllamaAdapter } from "../llm/ollama.ts";
+import { ollamaToolDefinitions, registeredTools, type RegisteredToolName } from "../llm/tools.ts";
+import type { LlmMessage } from "../llm/adapter.ts";
 
 type Call = { id: string; name: string; arguments: Record<string, unknown>; result: string; status: "ok" | "blocked" | "pending" };
-type Pending = { operationId: string; caso: string; paquete: Paquete; validacion: Validacion; payload: unknown };
+type Pending = { operationId: string; caso: string; paquete: Paquete; validacion: Validacion; payload: unknown; payloadHash: string };
 type ChatMessage = { role: "user" | "assistant"; content: string; ts: string };
-type Session = { id: string; messages: ChatMessage[]; toolCalls: Call[]; pending?: Pending };
+type Session = { id: string; messages: ChatMessage[]; toolCalls: Call[]; llmMessages: LlmMessage[]; pending?: Pending };
 type AppOptions = { directory?: string; adapter?: LlmAdapter };
+type AgentState = { caso: string; paquete?: Paquete; validacion?: Validacion; evidenciaSha256?: string; payload?: unknown; createdNumber?: string; pendingRequest: boolean; createAttempted: boolean };
 
 const BodySchema = z.object({ sessionId: z.string().uuid().optional(), message: z.string().trim().min(1).max(1000) }).strict();
 const rootDefault = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -25,7 +29,7 @@ const affirmative = /^(confirmo|confirmar|sí,? confirmo|si,? confirmo)$/i;
 
 export function createChatServer(options: AppOptions = {}): Server {
   const directory = path.resolve(options.directory ?? rootDefault);
-  const adapter = options.adapter ?? new SimulatedLlmAdapter();
+  const adapter = options.adapter ?? (process.env.LLM_ADAPTER === "mock" ? new SimulatedLlmAdapter() : new OllamaAdapter());
   return createServer((req, res) => {
     void route(req, res, directory, adapter).catch(() => {
       if (res.headersSent) { res.destroy(); return; }
@@ -66,13 +70,15 @@ async function route(req: IncomingMessage, res: ServerResponse, directory: strin
   sendJson(res, 404, { error: "Ruta no encontrada." });
 }
 
-function createSession(): Session { const id = randomUUID(); const session = { id, messages: [], toolCalls: [] }; sessions.set(id, session); return session; }
+function createSession(): Session { const id = randomUUID(); const session = { id, messages: [], toolCalls: [], llmMessages: [] }; sessions.set(id, session); return session; }
 
 async function handleMessage(session: Session, message: string, directory: string, adapter: LlmAdapter): Promise<{ reply: string; calls: Call[] }> {
+  if (adapter.chatWithTools) return handleOllamaMessage(session, message, directory, adapter);
   const calls: Call[] = [];
   const context = { directory, sessionId: session.id };
   if (session.pending && affirmative.test(message)) {
     const pending = session.pending;
+    if (hashPayload(pending.payload) !== pending.payloadHash) { session.pending = undefined; return { reply: "La operación pendiente ya no coincide con su payload; no se creó la orden.", calls }; }
     session.pending = undefined;
     const result = await invoke("oc_crear", { caso: pending.caso, paquete: pending.paquete, validacion: pending.validacion, payload: pending.payload, confirmado: true }, context);
     const created = nestedData<{ ok: boolean; numero_oc?: string; error?: string }>(result);
@@ -113,7 +119,7 @@ async function handleMessage(session: Session, message: string, directory: strin
   if (!built.ok || !built.data?.payload) return { reply: "No se pudo preparar un payload válido; no se creó la orden.", calls };
   if (validacion.confirmaciones.length) {
     const operationId = randomUUID();
-    session.pending = { operationId, caso, paquete, validacion, payload: built.data.payload };
+    session.pending = { operationId, caso, paquete, validacion, payload: built.data.payload, payloadHash: hashPayload(built.data.payload) };
     const details = validacion.confirmaciones.map(c => `${c.codigo}: ${c.detalle}`).join("; ");
     const text = `El caso ${caso} está validado, pero requiere confirmación: ${details}. Para crear la OC, responde “Confirmo”. Operación pendiente ${operationId}.`;
     return { reply: (await adapter.respond({ userMessage: message, toolSummaries: calls.map(x => x.result), outcome: { kind: "awaiting_confirmation", caso, message: text } })).text, calls };
@@ -123,6 +129,170 @@ async function handleMessage(session: Session, message: string, directory: strin
   const text = created.data?.ok ? `Solicitud ${caso} procesada correctamente. Se creó la OC ${created.data.numero_oc}.` : `No se creó la orden de ${caso}.`;
   return { reply: (await adapter.respond({ userMessage: message, toolSummaries: calls.map(x => x.result), outcome: { kind: created.data?.ok ? "created" : "blocked", caso, message: text } })).text, calls };
 }
+
+async function handleOllamaMessage(session: Session, message: string, directory: string, adapter: LlmAdapter): Promise<{ reply: string; calls: Call[] }> {
+  const calls: Call[] = [];
+  const context = { directory, sessionId: session.id };
+  if (session.pending) {
+    session.llmMessages.push({ role: "user", content: message });
+    if (!affirmative.test(message)) return { reply: `La operación ${session.pending.operationId} de ${session.pending.caso} sigue pendiente. Para autorizarla, responde “Confirmo”; cualquier otro mensaje no la ejecuta.`, calls };
+    const pending = session.pending;
+    if (hashPayload(pending.payload) !== pending.payloadHash) { session.pending = undefined; return { reply: "La operación pendiente ya no coincide con su payload; no se creó la orden.", calls }; }
+    session.pending = undefined;
+    const result = parseToolResult(await crear.execute({ caso: pending.caso, paquete: pending.paquete, validacion: pending.validacion, payload: pending.payload, confirmado: true }, context));
+    session.llmMessages.push({ role: "tool", tool_name: "oc_crear", content: JSON.stringify(result) });
+    const created = nestedData<{ ok: boolean; numero_oc?: string; error?: string }>(result);
+    const succeeded = Boolean(created.data?.ok && created.data.numero_oc);
+    calls.push(await record(directory, session, makeCall("oc_crear", { caso: pending.caso, operationId: pending.operationId, payloadHash: pending.payloadHash }, succeeded ? `OC ${created.data!.numero_oc} creada` : "Creación rechazada por el backend", succeeded ? "ok" : "blocked")));
+    session.llmMessages.push({ role: "assistant", content: succeeded ? `Confirmación aceptada. OC ${created.data!.numero_oc} creada.` : "El backend rechazó la creación de la OC." });
+    return { reply: succeeded ? `Confirmación aceptada para ${pending.caso} y operación ${pending.operationId}. Se creó la OC ${created.data!.numero_oc}.` : `La solicitud ${pending.caso} no se creó: ${created.data?.error ?? "falló el control del backend"}.`, calls };
+  }
+
+  const match = message.match(command);
+  if (!match) return { reply: "Indica una solicitud para procesar, por ejemplo: «Procesa sol-001».", calls };
+  const caso = match[1].toLowerCase();
+  const state: AgentState = { caso, pendingRequest: false, createAttempted: false };
+  const chat = adapter.chatWithTools;
+  if (!chat) return { reply: "El adaptador local no soporta llamadas a herramientas.", calls };
+  try {
+    if (!session.llmMessages.length) {
+      const prompt = await readFile(safePath(directory, "agent", "prompt.md"), "utf8");
+      session.llmMessages.push({ role: "system", content: `${prompt}\n\nUsa únicamente las herramientas registradas. Procesa secuencialmente: leer, validar, generar evidencia, construir payload y crear. El backend decide bloqueos y autorizaciones.` });
+    }
+    session.llmMessages.push({ role: "user", content: message });
+    let usedCalls = 0, finished = false, limitReached = false;
+    for (let iteration = 0; iteration < 6; iteration++) {
+      const answer = await chat.call(adapter, { messages: session.llmMessages, tools: ollamaToolDefinitions() });
+      session.llmMessages.push(answer.message);
+      const modelCalls = answer.message.tool_calls ?? [];
+      if (!modelCalls.length) { finished = true; break; }
+      for (const toolCall of modelCalls) {
+        if (usedCalls >= 6) { limitReached = true; break; }
+        usedCalls++;
+        const name = toolCall.function.name;
+        const execution = await executeModelTool(name, toolCall.function.arguments, state, context);
+        if (execution.call) { calls.push(await record(directory, session, execution.call)); }
+        session.llmMessages.push({ role: "tool", tool_name: name, content: execution.result });
+      }
+      if (limitReached) break;
+    }
+    if (!finished && !limitReached) limitReached = true;
+    if (state.validacion && !state.validacion.apta) {
+      if (!state.createAttempted) await logBlockedCreate(state, directory, session, context, calls);
+      const text = `No se creó la orden para ${caso}. Bloqueos: ${state.validacion.bloqueos.join("; ")}.`;
+      session.llmMessages.push({ role: "assistant", content: text });
+      return { reply: text, calls };
+    }
+    if (!state.paquete) return { reply: limitReached ? "El modelo alcanzó el límite de herramientas sin leer el paquete; no se ejecutó ninguna acción." : "El modelo local no solicitó leer el paquete. No se ejecutó ninguna acción.", calls };
+    if (!state.validacion) {
+      await executeModelTool("oc_validar", { caso }, state, context).then(async r => { if (r.call) calls.push(await record(directory, session, r.call)); });
+    }
+    if (state.validacion && !state.validacion.apta) {
+      if (!state.createAttempted) await logBlockedCreate(state, directory, session, context, calls);
+      const text = `No se creó la orden para ${caso}. Bloqueos: ${state.validacion.bloqueos.join("; ")}.`;
+      session.llmMessages.push({ role: "assistant", content: text });
+      return { reply: text, calls };
+    }
+    if (!state.validacion?.apta) return { reply: "El backend no pudo completar las validaciones; no se creó la orden.", calls };
+    if (!state.evidenciaSha256) {
+      const evidence = await executeModelTool("oc_generar_evidencia", { caso }, state, context);
+      if (evidence.call) calls.push(await record(directory, session, evidence.call));
+    }
+    if (!state.payload) {
+      const built = await executeModelTool("oc_construir_payload", { caso }, state, context);
+      if (built.call) calls.push(await record(directory, session, built.call));
+    }
+    if (!state.payload) return { reply: "No se pudo construir un payload SAP válido; no se creó la orden.", calls };
+    if (state.validacion.confirmaciones.length) {
+      if (!state.createAttempted) await attemptCreate(state, directory, session, context, calls);
+      const payloadHash = hashPayload(state.payload);
+      const operationId = randomUUID();
+      session.pending = { operationId, caso, paquete: state.paquete, validacion: state.validacion, payload: state.payload, payloadHash };
+      const details = state.validacion.confirmaciones.map(item => `${item.codigo}: ${item.detalle}`).join("; ");
+      const text = `El caso ${caso} está validado, pero requiere confirmación: ${details}. Para crear la OC, responde “Confirmo”. Operación pendiente ${operationId}.`;
+      session.llmMessages.push({ role: "assistant", content: text });
+      return { reply: text, calls };
+    }
+    if (limitReached && !state.createAttempted) return { reply: "Se alcanzó el límite de seis iteraciones de herramientas. No se creó la OC; puedes reintentar en otro turno.", calls };
+    if (!state.createAttempted) await attemptCreate(state, directory, session, context, calls);
+    const text = state.createdNumber ? `Solicitud ${caso} procesada correctamente. Se creó la OC ${state.createdNumber}.` : "No se creó la orden; el backend rechazó la operación.";
+    session.llmMessages.push({ role: "assistant", content: text });
+    return { reply: text, calls };
+  } catch (error) {
+    const text = error instanceof Error && error.message.includes("tiempo límite") ? "El modelo local excedió el tiempo límite. No se autorizó ni creó ninguna OC." : "No fue posible completar el turno con el modelo local. Revisa que Ollama esté activo y vuelve a intentar.";
+    return { reply: text, calls };
+  }
+}
+
+async function executeModelTool(name: string, rawArgs: unknown, state: AgentState, context: { directory: string; sessionId: string }): Promise<{ result: string; call?: Call }> {
+  const registered = registeredTools().find(item => item.name === name);
+  if (!registered) return { result: JSON.stringify({ ok: false, error: "Herramienta desconocida; rechazada por allowlist." }), call: makeCall("herramienta_desconocida", {}, "Herramienta rechazada por allowlist", "blocked") };
+  let argsValue = rawArgs;
+  if (typeof argsValue === "string") { try { argsValue = JSON.parse(argsValue); } catch { argsValue = null; } }
+  const parsed = registered.schema.safeParse(argsValue);
+  if (!parsed.success) return { result: JSON.stringify({ ok: false, error: "Argumentos inválidos; rechazados por Zod." }), call: makeCall(name, {}, "Argumentos inválidos rechazados por Zod", "blocked") };
+  const caso = parsed.data.caso;
+  if (caso !== state.caso) return { result: JSON.stringify({ ok: false, error: "El caso no coincide con la solicitud activa." }), call: makeCall(name, { caso }, "Caso distinto al solicitado; acción rechazada", "blocked") };
+  if (name === "oc_crear" && state.createAttempted) return { result: JSON.stringify({ ok: false, error: "Intento duplicado rechazado." }), call: makeCall(name, { caso }, "Intento duplicado rechazado", "blocked") };
+  const ctx = context;
+  if (name === "oc_leer_paquete") {
+    const data = parseToolResult(await leer_paquete.execute({ caso }, ctx));
+    state.paquete = nestedData<{ paquete: Paquete }>(data).data?.paquete;
+    return { result: JSON.stringify(data), call: makeCall(name, { caso }, state.paquete ? "Paquete local leído y normalizado" : "No se pudo leer el paquete", state.paquete ? "ok" : "blocked") };
+  }
+  if (name === "oc_validar") {
+    if (!state.paquete) return rejectedTool(name, caso, "Primero debes leer el paquete.");
+    const data = parseToolResult(await validar.execute({ caso, paquete: state.paquete }, ctx));
+    state.validacion = nestedData<Validacion>(data).data;
+    const ok = Boolean(state.validacion);
+    return { result: JSON.stringify(data), call: makeCall(name, { caso }, ok ? `${state.validacion!.bloqueos.length} bloqueo(s), ${state.validacion!.confirmaciones.length} confirmación(es)` : "Validación fallida", ok && !state.validacion!.apta ? "blocked" : ok && state.validacion!.confirmaciones.length ? "pending" : ok ? "ok" : "blocked") };
+  }
+  if (name === "oc_generar_evidencia") {
+    if (!state.paquete || !state.validacion?.apta) return rejectedTool(name, caso, "Solo se genera evidencia después de validar un paquete apto.");
+    const data = parseToolResult(await generar_evidencia.execute({ caso }, ctx));
+    state.evidenciaSha256 = nestedData<{ sha256: string }>(data).data?.sha256;
+    return { result: JSON.stringify(data), call: makeCall(name, { caso }, state.evidenciaSha256 ? "Evidencia generada en out/" : "No se pudo generar la evidencia", state.evidenciaSha256 ? "ok" : "blocked") };
+  }
+  if (name === "oc_construir_payload") {
+    if (!state.paquete || !state.validacion?.apta || !state.evidenciaSha256) return rejectedTool(name, caso, "Primero lee, valida y genera la evidencia.");
+    const data = parseToolResult(await construir_payload.execute({ caso, paquete: state.paquete, derivados: state.validacion.derivados, evidencia_sha256: state.evidenciaSha256 }, ctx));
+    state.payload = nestedData<{ payload: unknown }>(data).data?.payload;
+    return { result: JSON.stringify(data), call: makeCall(name, { caso }, state.payload ? "Payload SAP construido y validado" : "Payload rechazado por su esquema", state.payload ? "ok" : "blocked") };
+  }
+  if (name === "oc_crear") {
+    if (!state.paquete || !state.validacion) return rejectedTool(name, caso, "No existe un resultado de validación del backend.");
+    if (!state.validacion.apta) { state.createAttempted = true; const data = parseToolResult(await crear.execute({ caso, paquete: state.paquete, validacion: state.validacion, payload: {} }, ctx)); return { result: JSON.stringify(data), call: makeCall(name, { caso }, "Creación bloqueada por validaciones", "blocked") }; }
+    if (!state.payload) return rejectedTool(name, caso, "No existe un payload construido por el backend.");
+    state.createAttempted = true;
+    const data = parseToolResult(await crear.execute({ caso, paquete: state.paquete, validacion: state.validacion, payload: state.payload }, ctx));
+    const created = nestedData<{ ok: boolean; numero_oc?: string }>(data).data;
+    if (created?.ok) state.createdNumber = created.numero_oc;
+    if (state.validacion.confirmaciones.length) state.pendingRequest = true;
+    return { result: JSON.stringify(data), call: makeCall(name, { caso }, created?.numero_oc ? `OC ${created.numero_oc} creada` : state.pendingRequest ? "Se requiere confirmación humana" : "Creación rechazada por el backend", created?.ok ? "ok" : state.pendingRequest ? "pending" : "blocked") };
+  }
+  return rejectedTool(name, caso, "Herramienta no implementada.");
+}
+
+async function attemptCreate(state: AgentState, directory: string, session: Session, context: { directory: string; sessionId: string }, calls: Call[]): Promise<void> {
+  if (!state.paquete || !state.validacion || !state.payload || state.createAttempted) return;
+  state.createAttempted = true;
+  const data = parseToolResult(await crear.execute({ caso: state.caso, paquete: state.paquete, validacion: state.validacion, payload: state.payload }, context));
+  const created = nestedData<{ ok: boolean; numero_oc?: string }>(data).data;
+  if (created?.ok) state.createdNumber = created.numero_oc;
+  const status = created?.ok ? "ok" : state.validacion.confirmaciones.length ? "pending" : "blocked";
+  calls.push(await record(directory, session, makeCall("oc_crear", { caso: state.caso }, created?.numero_oc ? `OC ${created.numero_oc} creada` : state.validacion.confirmaciones.length ? "Se requiere confirmación humana" : "Creación rechazada por el backend", status)));
+}
+
+async function logBlockedCreate(state: AgentState, directory: string, session: Session, context: { directory: string; sessionId: string }, calls: Call[]): Promise<void> {
+  if (!state.paquete || !state.validacion || state.validacion.apta || state.createAttempted) return;
+  state.createAttempted = true;
+  await crear.execute({ caso: state.caso, paquete: state.paquete, validacion: state.validacion, payload: {} }, context);
+  calls.push(await record(directory, session, makeCall("oc_crear", { caso: state.caso }, "Creación bloqueada por controles RC", "blocked")));
+}
+
+function rejectedTool(name: string, caso: string, message: string) { return { result: JSON.stringify({ ok: false, error: message }), call: makeCall(name, { caso }, message, "blocked") }; }
+function parseToolResult(raw: string): unknown { try { return JSON.parse(raw); } catch { return { ok: false, error: "La herramienta produjo una respuesta inválida." }; } }
+function hashPayload(payload: unknown): string { return createHash("sha256").update(JSON.stringify(payload)).digest("hex"); }
 
 async function invoke(name: string, args: Record<string, unknown>, context: { directory: string; sessionId: string }): Promise<unknown> {
   const tools: Record<string, { execute: (a: never, c: typeof context) => Promise<string> }> = { oc_leer_paquete: leer_paquete as never, oc_validar: validar as never, oc_construir_payload: construir_payload as never, oc_generar_evidencia: generar_evidencia as never, oc_crear: crear as never };
