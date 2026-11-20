@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Órdenes de compra | Demo local</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="layout">
+    <header class="topbar"><div><p class="eyebrow">RETO 03 · DEMO LOCAL</p><h1>Órdenes de compra</h1></div><button id="new-session" class="secondary" type="button">Nueva sesión</button></header>
+    <section class="panel" aria-label="Conversación con el asistente">
+      <div id="status" class="status">Conectando con el backend simulado…</div>
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <form id="chat-form"><label class="sr-only" for="message">Mensaje</label><input id="message" autocomplete="off" maxlength="1000" placeholder="Ej.: Procesa sol-001" required><button id="send" type="submit">Enviar</button></form>
+    </section>
+    <section class="panel calls-panel"><h2>Actividad de herramientas</h2><ol id="calls" class="calls"><li class="empty">Las llamadas aparecerán aquí.</li></ol></section>
+    <footer>Las órdenes y el asistente son simulados. No existe conexión a SAP ni a un proveedor de IA.</footer>
+  </main>
+</body>
+</html>

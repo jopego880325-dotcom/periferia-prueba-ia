@@ -1,0 +1,24 @@
+﻿**/node_modules/
+**/out/
+**/.env
+**/.env.*
+!**/.env.example
+**/dist/
+**/coverage/
+**/*.log
+_insumos-originales/
+*.zip
+
+# Material de trabajo y copias originales
+/Periferia-Prueba/
+/retos-ia-periferia-it-group/
+/_insumos-originales/
+*.zip
+
+# Instructivos originales de la evaluación
+**/PRD.md
+
+# Datos originales de evaluación: solo uso local
+/Reto-01-Proveedores/fixtures/
+/Reto-02-Contratos/fixtures/
+/Reto-03-Compras/fixtures/
